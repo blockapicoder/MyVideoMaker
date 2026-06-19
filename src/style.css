@@ -108,7 +108,7 @@ textarea {
 
 .project-bar {
   display: grid;
-  grid-template-columns: minmax(220px, 1.2fr) auto minmax(220px, 1fr) auto;
+  grid-template-columns: minmax(220px, 1.2fr) minmax(220px, 1fr) auto;
   align-items: end;
   gap: 12px;
   margin-bottom: 16px;
@@ -409,6 +409,20 @@ h3 {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
+}
+
+.zoom-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.recording-indicator {
+  color: #ffc5b8;
+  font-size: 0.85rem;
+  font-weight: 800;
 }
 
 .zoom-toolbar strong {

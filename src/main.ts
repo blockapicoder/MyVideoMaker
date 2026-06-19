@@ -49,16 +49,11 @@ type SavedPresentation = {
   }>;
 };
 
-type DirectoryPickerOptions = {
-  mode?: "read" | "readwrite";
-};
-
-type UserDirectoryHandle = FileSystemDirectoryHandle & {
-  values: () => AsyncIterableIterator<FileSystemHandle>;
-};
-
-type DirectoryPickerWindow = Window & {
-  showDirectoryPicker?: (options?: DirectoryPickerOptions) => Promise<UserDirectoryHandle>;
+type PresentationListItem = {
+  id: string;
+  name: string;
+  size: number;
+  updatedAt: string;
 };
 
 const resolutions: ResolutionPreset[] = [
@@ -82,8 +77,9 @@ const state = {
   pages: [createPage(1)],
   selectedPageId: "",
   presentationName: "Nouvelle presentation",
-  directoryHandle: null as UserDirectoryHandle | null,
-  presentationFiles: [] as string[],
+  backendDirectory: "",
+  backendReady: false,
+  presentationFiles: [] as PresentationListItem[],
   selectedPresentationFile: "",
   isZoomed: false,
   resolutionIndex: 1,
@@ -178,7 +174,10 @@ function render(): void {
       <main class="zoom-shell">
         <div class="zoom-toolbar">
           <strong>${escapeHtml(page.title || "Page courante")}</strong>
-          <button id="closeZoom" type="button">Fermer zoom</button>
+          <div class="zoom-actions">
+            ${state.isRecording ? `<span class="recording-indicator">Enregistrement vocal en cours</span><button id="stopZoomVoice" type="button">Arreter la voix</button>` : ""}
+            <button id="closeZoom" type="button">Fermer zoom</button>
+          </div>
         </div>
         <div class="zoom-preview">${slidePreviewTemplate(page)}</div>
       </main>
@@ -209,22 +208,19 @@ function render(): void {
           Nom de la presentation
           <input id="presentationName" type="text" value="${escapeHtml(state.presentationName)}" />
         </label>
-        <button id="chooseDirectory" type="button">Choisir dossier</button>
         <label class="project-select-field">
           Presentations du dossier
-          <select id="presentationSelect" ${state.directoryHandle ? "" : "disabled"}>
+          <select id="presentationSelect" ${state.backendReady ? "" : "disabled"}>
             <option value="">${state.presentationFiles.length ? "Selectionner..." : "Aucune presentation"}</option>
-            ${state.presentationFiles.map((fileName) => `<option value="${escapeHtml(fileName)}" ${fileName === state.selectedPresentationFile ? "selected" : ""}>${escapeHtml(presentationNameFromFile(fileName))}</option>`).join("")}
+            ${state.presentationFiles.map((item) => `<option value="${escapeHtml(item.id)}" ${item.id === state.selectedPresentationFile ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("")}
           </select>
         </label>
         <div class="project-actions">
-          <button id="savePresentation" type="button" ${state.directoryHandle ? "" : "disabled"}>Enregistrer</button>
+          <button id="savePresentation" type="button" ${state.backendReady ? "" : "disabled"}>Enregistrer</button>
           <button id="openPresentation" type="button" ${state.selectedPresentationFile ? "" : "disabled"}>Ouvrir</button>
           <button id="deletePresentation" class="danger" type="button" ${state.selectedPresentationFile ? "" : "disabled"}>Supprimer</button>
-          <label class="load-button" for="loadPresentationInput">Importer fichier</label>
-          <input id="loadPresentationInput" class="hidden-file" type="file" accept="application/json,.json" />
         </div>
-        <p class="project-directory">${state.directoryHandle ? `Dossier: ${escapeHtml(state.directoryHandle.name)}` : "Aucun dossier selectionne"}</p>
+        <p class="project-directory">${state.backendReady ? `Stockage: ${escapeHtml(state.backendDirectory)}` : "API backend indisponible"}</p>
       </section>
 
       <section class="workspace">
@@ -411,10 +407,6 @@ function bindEvents(): void {
     state.presentationName = (event.currentTarget as HTMLInputElement).value;
   });
 
-  document.querySelector<HTMLButtonElement>("#chooseDirectory")?.addEventListener("click", () => {
-    void choosePresentationDirectory();
-  });
-
   document.querySelector<HTMLSelectElement>("#presentationSelect")?.addEventListener("change", (event) => {
     state.selectedPresentationFile = (event.currentTarget as HTMLSelectElement).value;
     render();
@@ -568,10 +560,6 @@ function bindEvents(): void {
     void savePresentation();
   });
 
-  document.querySelector<HTMLInputElement>("#loadPresentationInput")?.addEventListener("change", (event) => {
-    void loadPresentation(event.currentTarget as HTMLInputElement);
-  });
-
   if (selectedPage().screenVideoUrl) {
     requestAnimationFrame(() => {
       syncTrimControls();
@@ -583,6 +571,10 @@ function bindZoomEvents(): void {
   document.querySelector<HTMLButtonElement>("#closeZoom")?.addEventListener("click", () => {
     state.isZoomed = false;
     render();
+  });
+
+  document.querySelector<HTMLButtonElement>("#stopZoomVoice")?.addEventListener("click", () => {
+    state.recorder?.stop();
   });
 
   window.onkeydown = (event) => {
@@ -756,6 +748,7 @@ async function toggleRecording(): Promise<void> {
   });
 
   state.recorder.start();
+  state.isZoomed = true;
   render();
 }
 
@@ -769,6 +762,7 @@ async function saveRecording(): Promise<void> {
   state.isRecording = false;
   state.recorder = null;
   state.recordedStream = null;
+  state.isZoomed = false;
   render();
 }
 
@@ -1082,59 +1076,37 @@ function newPresentation(): void {
   render();
 }
 
-async function choosePresentationDirectory(): Promise<void> {
-  const pickerWindow = window as DirectoryPickerWindow;
-
-  if (!pickerWindow.showDirectoryPicker) {
-    state.renderProgress = "La selection de dossier n'est pas disponible dans ce navigateur.";
-    render();
-    return;
-  }
-
-  try {
-    state.directoryHandle = await pickerWindow.showDirectoryPicker({ mode: "readwrite" });
-    state.selectedPresentationFile = "";
-    await refreshPresentationFiles();
-    state.renderProgress = "Dossier selectionne.";
-  } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") {
-      return;
-    }
-    state.renderProgress = "Impossible d'ouvrir ce dossier.";
-  }
-
-  render();
-}
-
 async function refreshPresentationFiles(): Promise<void> {
-  if (!state.directoryHandle) {
-    state.presentationFiles = [];
-    return;
+  const response = await fetch("/api/presentations", { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error("API indisponible");
   }
 
-  const files: string[] = [];
-  for await (const entry of state.directoryHandle.values()) {
-    if (entry.kind === "file" && entry.name.endsWith(".presentation.json")) {
-      files.push(entry.name);
-    }
-  }
-  state.presentationFiles = files.sort((left, right) => left.localeCompare(right, "fr"));
+  const payload = await response.json() as {
+    presentationDirectory: string;
+    presentations: PresentationListItem[];
+  };
+  state.backendReady = true;
+  state.backendDirectory = payload.presentationDirectory;
+  state.presentationFiles = payload.presentations;
 
-  if (state.selectedPresentationFile && !state.presentationFiles.includes(state.selectedPresentationFile)) {
+  if (state.selectedPresentationFile && !state.presentationFiles.some((item) => item.id === state.selectedPresentationFile)) {
     state.selectedPresentationFile = "";
   }
 }
 
 async function openSelectedPresentation(): Promise<void> {
-  if (!state.directoryHandle || !state.selectedPresentationFile) {
+  if (!state.selectedPresentationFile) {
     return;
   }
 
   try {
-    const fileHandle = await state.directoryHandle.getFileHandle(state.selectedPresentationFile);
-    const file = await fileHandle.getFile();
-    const rawPresentation = JSON.parse(await file.text()) as Partial<SavedPresentation>;
-    applySavedPresentation(rawPresentation, presentationNameFromFile(file.name));
+    const response = await fetch(`/api/presentations/${encodeURIComponent(state.selectedPresentationFile)}`, { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error("Chargement impossible");
+    }
+    const rawPresentation = await response.json() as Partial<SavedPresentation>;
+    applySavedPresentation(rawPresentation, presentationNameFromFile(state.selectedPresentationFile));
     render();
   } catch {
     state.renderProgress = "Impossible d'ouvrir cette presentation.";
@@ -1143,7 +1115,7 @@ async function openSelectedPresentation(): Promise<void> {
 }
 
 async function deleteSelectedPresentation(): Promise<void> {
-  if (!state.directoryHandle || !state.selectedPresentationFile) {
+  if (!state.selectedPresentationFile) {
     return;
   }
 
@@ -1152,7 +1124,12 @@ async function deleteSelectedPresentation(): Promise<void> {
   }
 
   try {
-    await state.directoryHandle.removeEntry(state.selectedPresentationFile);
+    const response = await fetch(`/api/presentations/${encodeURIComponent(state.selectedPresentationFile)}`, {
+      method: "DELETE",
+    });
+    if (!response.ok) {
+      throw new Error("Suppression impossible");
+    }
     state.selectedPresentationFile = "";
     await refreshPresentationFiles();
     state.renderProgress = "Presentation supprimee.";
@@ -1164,8 +1141,8 @@ async function deleteSelectedPresentation(): Promise<void> {
 }
 
 async function savePresentation(): Promise<void> {
-  if (!state.directoryHandle) {
-    state.renderProgress = "Choisissez d'abord un dossier utilisateur.";
+  if (!state.backendReady) {
+    state.renderProgress = "L'API backend est indisponible.";
     render();
     return;
   }
@@ -1176,10 +1153,14 @@ async function savePresentation(): Promise<void> {
   try {
     const presentation = await buildSavedPresentation();
     const fileName = presentationFileName(state.presentationName);
-    const fileHandle = await state.directoryHandle.getFileHandle(fileName, { create: true });
-    const writable = await fileHandle.createWritable();
-    await writable.write(JSON.stringify(presentation, null, 2));
-    await writable.close();
+    const response = await fetch(`/api/presentations/${encodeURIComponent(fileName)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(presentation),
+    });
+    if (!response.ok) {
+      throw new Error("Sauvegarde impossible");
+    }
     state.selectedPresentationFile = fileName;
     await refreshPresentationFiles();
     state.renderProgress = "Presentation sauvegardee.";
@@ -1187,27 +1168,6 @@ async function savePresentation(): Promise<void> {
     state.renderProgress = "Impossible de sauvegarder la presentation.";
   }
 
-  render();
-}
-
-async function loadPresentation(input: HTMLInputElement): Promise<void> {
-  const file = input.files?.[0];
-
-  if (!file) {
-    return;
-  }
-
-  state.renderProgress = "Chargement de la presentation...";
-  render();
-
-  try {
-    const rawPresentation = JSON.parse(await file.text()) as Partial<SavedPresentation>;
-    applySavedPresentation(rawPresentation, fileBaseName(file.name).replace(/\.presentation$/i, ""));
-  } catch {
-    state.renderProgress = "Impossible de charger cette presentation.";
-  }
-
-  input.value = "";
   render();
 }
 
@@ -1718,3 +1678,11 @@ function escapeHtml(value: string): string {
 }
 
 render();
+void refreshPresentationFiles()
+  .then(() => render())
+  .catch(() => {
+    state.backendReady = false;
+    state.backendDirectory = "";
+    state.renderProgress = "API backend indisponible.";
+    render();
+  });
