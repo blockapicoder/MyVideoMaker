@@ -106,7 +106,7 @@ function createPage(position: number): SlidePage {
   return {
     id: crypto.randomUUID(),
     title: "",
-    text: "Votre texte de presentation",
+    text: "",
     duration: DEFAULT_PAGE_DURATION_SECONDS,
     backgroundUrl: "",
     foregroundUrl: "",
@@ -339,6 +339,8 @@ function render(): void {
             </div>
             <div class="voice-actions">
               <button id="recordVoice" type="button">${state.isRecording ? "Arreter" : "Enregistrer"}</button>
+              <label class="load-button voice-file-button" for="voiceFileInput">Ajouter WAV</label>
+              <input id="voiceFileInput" class="hidden-file" type="file" accept="audio/wav,audio/x-wav,.wav" />
               <button id="clearVoice" type="button" ${page.voiceUrl || state.isRecording ? "" : "disabled"}>Effacer</button>
             </div>
             ${
@@ -496,6 +498,10 @@ function bindEvents(): void {
 
   document.querySelector<HTMLButtonElement>("#clearVoice")?.addEventListener("click", () => {
     clearVoice();
+  });
+
+  document.querySelector<HTMLInputElement>("#voiceFileInput")?.addEventListener("change", (event) => {
+    void handleVoiceFile(event.currentTarget as HTMLInputElement);
   });
 
   document.querySelector<HTMLButtonElement>("#recordScreen")?.addEventListener("click", () => {
@@ -674,7 +680,7 @@ function isPageUntitled(page: SlidePage): boolean {
 
 function isFreshPage(page: SlidePage): boolean {
   return isPageUntitled(page)
-    && page.text === "Votre texte de presentation"
+    && page.text.trim() === ""
     && !page.backgroundUrl
     && !page.foregroundUrl
     && !page.screenVideoUrl
@@ -774,6 +780,42 @@ function clearVoice(): void {
   const page = selectedPage();
   page.voiceUrl = "";
   page.voiceDuration = 0;
+  render();
+}
+
+async function handleVoiceFile(input: HTMLInputElement): Promise<void> {
+  const file = input.files?.[0];
+
+  if (!file) {
+    return;
+  }
+
+  if (!file.name.toLowerCase().endsWith(".wav")) {
+    state.renderProgress = "Selectionnez un fichier WAV.";
+    input.value = "";
+    render();
+    return;
+  }
+
+  const page = selectedPage();
+  const url = URL.createObjectURL(file);
+  const duration = await readMediaDuration(url);
+
+  if (duration <= 0) {
+    URL.revokeObjectURL(url);
+    state.renderProgress = "Impossible de lire ce fichier WAV.";
+    input.value = "";
+    render();
+    return;
+  }
+
+  page.voiceUrl = url;
+  page.voiceDuration = duration;
+  if (isPageUntitled(page)) {
+    page.title = fileBaseName(file.name);
+  }
+  state.renderProgress = "Piste WAV ajoutee.";
+  input.value = "";
   render();
 }
 
@@ -1417,7 +1459,7 @@ function drawSlide(
   if (screenVideo && screenVideo.videoWidth > 0 && screenVideo.videoHeight > 0) {
     drawCoverVideo(context, screenVideo, 0, 0, canvas.width, canvas.height);
   } else if (background) {
-    drawCoverImage(context, background, 0, 0, canvas.width, canvas.height);
+    drawContainImage(context, background, 0, 0, canvas.width, canvas.height);
   } else {
     const gradient = context.createLinearGradient(0, 0, canvas.width, canvas.height);
     gradient.addColorStop(0, "#263c52");
@@ -1457,20 +1499,6 @@ function drawSlide(
 
   context.fillStyle = frame % 2 === 0 ? "rgba(255, 255, 255, 0.01)" : "rgba(0, 0, 0, 0.01)";
   context.fillRect(canvas.width - 1, canvas.height - 1, 1, 1);
-}
-
-function drawCoverImage(
-  context: CanvasRenderingContext2D,
-  image: HTMLImageElement,
-  x: number,
-  y: number,
-  width: number,
-  height: number,
-): void {
-  const scale = Math.max(width / image.naturalWidth, height / image.naturalHeight);
-  const drawWidth = image.naturalWidth * scale;
-  const drawHeight = image.naturalHeight * scale;
-  context.drawImage(image, x + (width - drawWidth) / 2, y + (height - drawHeight) / 2, drawWidth, drawHeight);
 }
 
 function drawContainImage(

@@ -313,7 +313,8 @@ h3 {
   background:
     linear-gradient(135deg, #263c52, #15151a 52%, #6b3d2f);
   background-position: center;
-  background-size: cover;
+  background-repeat: no-repeat;
+  background-size: contain;
 }
 
 .slide-screen-video {
@@ -447,8 +448,13 @@ h3 {
 }
 
 .clear-tools button,
-.voice-actions button {
+.voice-actions button,
+.voice-actions .load-button {
   flex: 1;
+}
+
+.voice-file-button {
+  white-space: nowrap;
 }
 
 .voice-box,
