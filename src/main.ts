@@ -14,6 +14,10 @@ type SlidePage = {
   screenAudioEnabled: boolean;
   voiceUrl: string;
   voiceDuration: number;
+  voiceSourceDuration: number;
+  voiceOffset: number;
+  audioGroupId: string;
+  audioGroupSize: number;
 };
 
 type ResolutionPreset = {
@@ -46,6 +50,10 @@ type SavedPresentation = {
     screenAudioEnabled?: boolean;
     voiceUrl: string;
     voiceDuration: number;
+    voiceSourceDuration?: number;
+    voiceOffset?: number;
+    audioGroupId?: string;
+    audioGroupSize?: number;
   }>;
 };
 
@@ -78,16 +86,19 @@ const state = {
   selectedPageId: "",
   presentationName: "Nouvelle presentation",
   backendDirectory: "",
+  exportDirectory: "",
   backendReady: false,
   presentationFiles: [] as PresentationListItem[],
   selectedPresentationFile: "",
   isZoomed: false,
+  audioTargetPageIds: [] as string[],
   resolutionIndex: 1,
   qualityIndex: 1,
   isRecording: false,
   recorder: null as MediaRecorder | null,
   recordedChunks: [] as Blob[],
   recordedStream: null as MediaStream | null,
+  recordingTargetPageIds: [] as string[],
   isScreenRecording: false,
   screenRecorder: null as MediaRecorder | null,
   screenChunks: [] as Blob[],
@@ -97,9 +108,16 @@ const state = {
   renderProgress: "",
   videoUrl: "",
   videoSize: 0,
+  backendVideoUrl: "",
+  backendVideoPath: "",
+  backendVideoSize: 0,
+  backendVideoUpdatedAt: "",
 };
 
 state.selectedPageId = state.pages[0].id;
+state.audioTargetPageIds = [state.pages[0].id];
+
+let backendVideoLookupTimer = 0;
 
 function createPage(position: number): SlidePage {
   void position;
@@ -117,6 +135,10 @@ function createPage(position: number): SlidePage {
     screenAudioEnabled: true,
     voiceUrl: "",
     voiceDuration: 0,
+    voiceSourceDuration: 0,
+    voiceOffset: 0,
+    audioGroupId: "",
+    audioGroupSize: 1,
   };
 }
 
@@ -138,11 +160,12 @@ function selectedPage(): SlidePage {
 }
 
 function effectiveDuration(page: SlidePage): number {
+  if (page.voiceUrl) {
+    return normalizeDuration(page.voiceDuration);
+  }
+
   const screenDuration = clippedScreenDuration(page);
-  const hasTimedMedia = page.voiceUrl || page.screenVideoUrl;
-  const duration = hasTimedMedia
-    ? Math.max(page.voiceUrl ? page.voiceDuration : 0, screenDuration)
-    : page.duration;
+  const duration = page.screenVideoUrl ? screenDuration : page.duration;
   return normalizeDuration(duration);
 }
 
@@ -168,6 +191,11 @@ function render(): void {
   const app = getAppRoot();
   const page = selectedPage();
   const totalDuration = state.pages.reduce((sum, item) => sum + effectiveDuration(item), 0);
+  const audioTargetPages = state.pages.filter((item) => state.audioTargetPageIds.includes(item.id));
+  const unitAudioBlocked = audioTargetPages.length === 1
+    && audioTargetPages[0].audioGroupId !== ""
+    && audioTargetPages[0].audioGroupSize > 1;
+  const audioActionDisabled = audioTargetPages.length === 0 || unitAudioBlocked;
 
   if (state.isZoomed) {
     app.innerHTML = `
@@ -228,6 +256,11 @@ function render(): void {
           <div class="panel-head">
             <h2>Pages</h2>
             <button id="addPage" type="button">Creer page</button>
+          </div>
+          <div class="audio-selection-tools">
+            <span>Pages audio: ${audioTargetPages.length}</span>
+            <button id="selectAllAudioPages" type="button">Toutes</button>
+            <button id="clearAudioPageSelection" type="button">Aucune</button>
           </div>
           <div class="page-list">
             ${state.pages.map((item, index) => pageButtonTemplate(item, index)).join("")}
@@ -334,13 +367,18 @@ function render(): void {
 
           <section class="voice-box">
             <div>
-              <h3>Voix de la page</h3>
-              <p>${page.voiceUrl ? `Piste vocale: ${formatSeconds(page.voiceDuration)}` : "Aucune voix enregistree"}</p>
+              <h3>Piste audio</h3>
+              <p>${page.voiceUrl
+                ? page.audioGroupId && page.audioGroupSize > 1
+                  ? `Piste partagee: segment ${formatSeconds(page.voiceDuration)} sur ${page.audioGroupSize} pages`
+                  : `Piste de la page: ${formatSeconds(page.voiceDuration)}`
+                : "Aucune piste audio"}</p>
+              <p>${audioTargetPages.length > 1 ? `La piste sera partagee entre ${audioTargetPages.length} pages.` : unitAudioBlocked ? "Piste unitaire bloquee: cette page appartient a un groupe." : `${audioTargetPages.length} page selectionnee.`}</p>
             </div>
             <div class="voice-actions">
-              <button id="recordVoice" type="button">${state.isRecording ? "Arreter" : "Enregistrer"}</button>
-              <label class="load-button voice-file-button" for="voiceFileInput">Ajouter WAV</label>
-              <input id="voiceFileInput" class="hidden-file" type="file" accept="audio/wav,audio/x-wav,.wav" />
+              <button id="recordVoice" type="button" ${audioActionDisabled && !state.isRecording ? "disabled" : ""}>${state.isRecording ? "Arreter" : "Enregistrer"}</button>
+              <label class="load-button voice-file-button ${audioActionDisabled ? "is-disabled" : ""}" for="voiceFileInput" aria-disabled="${audioActionDisabled}">Ajouter WAV</label>
+              <input id="voiceFileInput" class="hidden-file" type="file" accept="audio/wav,audio/x-wav,.wav" ${audioActionDisabled ? "disabled" : ""} />
               <button id="clearVoice" type="button" ${page.voiceUrl || state.isRecording ? "" : "disabled"}>Effacer</button>
             </div>
             ${
@@ -366,8 +404,26 @@ function render(): void {
                 ${qualities.map((item, index) => `<option value="${index}" ${index === state.qualityIndex ? "selected" : ""}>${item.label}</option>`).join("")}
               </select>
             </label>
+            <div class="export-actions">
+              <button id="generateBackendVideo" type="button" ${state.isRendering || !state.backendReady ? "disabled" : ""}>
+                Generer cote back
+              </button>
+            </div>
+            <p class="status">${state.exportDirectory ? `Repertoire de generation: ${escapeHtml(state.exportDirectory)}` : "Repertoire de generation indisponible."}</p>
             <p class="status">${state.renderProgress}</p>
-            ${state.videoUrl ? `<a class="download-link" href="${state.videoUrl}" download="presentation-video.webm" data-video-size="${state.videoSize}">Telecharger la video (${formatFileSize(state.videoSize)})</a>` : ""}
+            ${state.videoUrl ? `
+              <div class="generated-video-panel">
+                <p class="status">Apercu navigateur: ${formatFileSize(state.videoSize)}</p>
+                <video class="generated-video" src="${state.videoUrl}" controls></video>
+              </div>
+            ` : ""}
+            ${state.backendVideoUrl ? `
+              <div class="generated-video-panel">
+                <p class="status">Derniere video: ${formatFileSize(state.backendVideoSize)}${state.backendVideoUpdatedAt ? ` - ${formatDateTime(state.backendVideoUpdatedAt)}` : ""}</p>
+                <video class="generated-video" src="${state.backendVideoUrl}" controls></video>
+              </div>
+            ` : ""}
+            ${state.backendVideoPath ? `<p class="status">Fichier: ${escapeHtml(state.backendVideoPath)}</p>` : ""}
           </section>
         </aside>
       </section>
@@ -379,13 +435,19 @@ function render(): void {
 
 function pageButtonTemplate(page: SlidePage, index: number): string {
   const selected = page.id === state.selectedPageId ? "is-selected" : "";
+  const audioSelected = state.audioTargetPageIds.includes(page.id);
   const displayTitle = page.title.trim() || `Page ${index + 1}`;
   return `
-    <button class="page-card ${selected}" type="button" data-page-id="${page.id}">
-      <span>${index + 1}</span>
-      <strong>${escapeHtml(displayTitle)}</strong>
-      <small>${formatSeconds(effectiveDuration(page))}</small>
-    </button>
+    <div class="page-list-item ${audioSelected ? "is-audio-selected" : ""}">
+      <label class="audio-page-check" title="Selectionner pour la piste audio">
+        <input type="checkbox" data-audio-page-id="${page.id}" ${audioSelected ? "checked" : ""} aria-label="Audio ${escapeHtml(displayTitle)}" />
+      </label>
+      <button class="page-card ${selected}" type="button" data-page-id="${page.id}">
+        <span>${index + 1}</span>
+        <strong>${escapeHtml(displayTitle)}</strong>
+        <small>${formatSeconds(effectiveDuration(page))}</small>
+      </button>
+    </div>
   `;
 }
 
@@ -405,8 +467,34 @@ function slidePreviewTemplate(page: SlidePage): string {
 }
 
 function bindEvents(): void {
+  document.querySelectorAll<HTMLInputElement>("[data-audio-page-id]").forEach((checkbox) => {
+    checkbox.addEventListener("change", () => {
+      const pageId = checkbox.dataset.audioPageId;
+      if (!pageId) {
+        return;
+      }
+      if (checkbox.checked) {
+        state.audioTargetPageIds = Array.from(new Set([...state.audioTargetPageIds, pageId]));
+      } else {
+        state.audioTargetPageIds = state.audioTargetPageIds.filter((id) => id !== pageId);
+      }
+      render();
+    });
+  });
+
+  document.querySelector<HTMLButtonElement>("#selectAllAudioPages")?.addEventListener("click", () => {
+    state.audioTargetPageIds = state.pages.map((item) => item.id);
+    render();
+  });
+
+  document.querySelector<HTMLButtonElement>("#clearAudioPageSelection")?.addEventListener("click", () => {
+    state.audioTargetPageIds = [];
+    render();
+  });
+
   document.querySelector<HTMLInputElement>("#presentationName")?.addEventListener("input", (event) => {
     state.presentationName = (event.currentTarget as HTMLInputElement).value;
+    scheduleBackendVideoLookup();
   });
 
   document.querySelector<HTMLSelectElement>("#presentationSelect")?.addEventListener("change", (event) => {
@@ -438,6 +526,7 @@ function bindEvents(): void {
     const page = createPage(state.pages.length + 1);
     state.pages.push(page);
     state.selectedPageId = page.id;
+    state.audioTargetPageIds = [page.id];
     render();
   });
 
@@ -446,8 +535,11 @@ function bindEvents(): void {
       return;
     }
     const index = state.pages.findIndex((item) => item.id === state.selectedPageId);
+    const deletedPageId = state.pages[index].id;
     state.pages.splice(index, 1);
     state.selectedPageId = state.pages[Math.max(0, index - 1)].id;
+    state.audioTargetPageIds = state.audioTargetPageIds.filter((id) => id !== deletedPageId);
+    refreshAudioGroups();
     render();
   });
 
@@ -558,6 +650,10 @@ function bindEvents(): void {
     void generateVideo();
   });
 
+  document.querySelector<HTMLButtonElement>("#generateBackendVideo")?.addEventListener("click", () => {
+    void generateBackendVideo();
+  });
+
   document.querySelector<HTMLButtonElement>("#newPresentation")?.addEventListener("click", () => {
     newPresentation();
   });
@@ -627,6 +723,7 @@ function movePage(direction: -1 | 1): void {
 
   const [page] = state.pages.splice(index, 1);
   state.pages.splice(nextIndex, 0, page);
+  refreshAudioGroups();
   render();
 }
 
@@ -670,6 +767,7 @@ async function createPagesFromImages(input: HTMLInputElement): Promise<void> {
   }
 
   state.selectedPageId = createdPages[0].id;
+  state.audioTargetPageIds = createdPages.map((page) => page.id);
   input.value = "";
   render();
 }
@@ -714,6 +812,12 @@ async function toggleRecording(): Promise<void> {
     return;
   }
 
+  const targets = selectedAudioTargetPages();
+  if (!canAssignAudioToTargets(targets)) {
+    render();
+    return;
+  }
+
   if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
     state.renderProgress = "Votre navigateur ne permet pas l'enregistrement audio.";
     render();
@@ -731,6 +835,7 @@ async function toggleRecording(): Promise<void> {
   });
   state.recordedStream = stream;
   state.recordedChunks = [];
+  state.recordingTargetPageIds = targets.map((page) => page.id);
   const audioMimeType = chooseAudioMimeType();
   const audioRecorderOptions: MediaRecorderOptions = {
     audioBitsPerSecond: AUDIO_BITS_PER_SECOND,
@@ -762,12 +867,12 @@ async function saveRecording(): Promise<void> {
   state.recordedStream?.getTracks().forEach((track) => track.stop());
   const blob = new Blob(state.recordedChunks, { type: "audio/webm" });
   const url = URL.createObjectURL(blob);
-  const page = selectedPage();
-  page.voiceUrl = url;
-  page.voiceDuration = await readMediaDuration(url);
+  const duration = await readMediaDuration(url);
+  assignAudioToPages(url, duration, state.recordingTargetPageIds);
   state.isRecording = false;
   state.recorder = null;
   state.recordedStream = null;
+  state.recordingTargetPageIds = [];
   state.isZoomed = false;
   render();
 }
@@ -778,8 +883,11 @@ function clearVoice(): void {
     return;
   }
   const page = selectedPage();
-  page.voiceUrl = "";
-  page.voiceDuration = 0;
+  if (page.audioGroupId && page.audioGroupSize > 1) {
+    state.pages.filter((item) => item.audioGroupId === page.audioGroupId).forEach(clearPageAudio);
+  } else {
+    clearPageAudio(page);
+  }
   render();
 }
 
@@ -797,7 +905,13 @@ async function handleVoiceFile(input: HTMLInputElement): Promise<void> {
     return;
   }
 
-  const page = selectedPage();
+  const targets = selectedAudioTargetPages();
+  if (!canAssignAudioToTargets(targets)) {
+    input.value = "";
+    render();
+    return;
+  }
+
   const url = URL.createObjectURL(file);
   const duration = await readMediaDuration(url);
 
@@ -809,14 +923,93 @@ async function handleVoiceFile(input: HTMLInputElement): Promise<void> {
     return;
   }
 
-  page.voiceUrl = url;
-  page.voiceDuration = duration;
-  if (isPageUntitled(page)) {
-    page.title = fileBaseName(file.name);
+  assignAudioToPages(url, duration, targets.map((page) => page.id));
+  if (targets.length === 1 && isPageUntitled(targets[0])) {
+    targets[0].title = fileBaseName(file.name);
   }
   state.renderProgress = "Piste WAV ajoutee.";
   input.value = "";
   render();
+}
+
+function selectedAudioTargetPages(): SlidePage[] {
+  return state.pages.filter((page) => state.audioTargetPageIds.includes(page.id));
+}
+
+function canAssignAudioToTargets(targets: SlidePage[]): boolean {
+  if (targets.length === 0) {
+    state.renderProgress = "Selectionnez au moins une page pour la piste audio.";
+    return false;
+  }
+
+  if (targets.length === 1 && targets[0].audioGroupId && targets[0].audioGroupSize > 1) {
+    state.renderProgress = "Cette page appartient a une piste partagee. Effacez d'abord la piste du groupe.";
+    return false;
+  }
+
+  return true;
+}
+
+function assignAudioToPages(url: string, totalDuration: number, pageIds: string[]): void {
+  const targets = state.pages.filter((page) => pageIds.includes(page.id));
+  if (targets.length === 0 || totalDuration <= 0) {
+    return;
+  }
+
+  detachAudioGroupsForPages(targets);
+  const groupId = targets.length > 1 ? crypto.randomUUID() : "";
+  const segmentDuration = totalDuration / targets.length;
+
+  targets.forEach((page, index) => {
+    page.voiceUrl = url;
+    page.voiceDuration = segmentDuration;
+    page.voiceSourceDuration = totalDuration;
+    page.voiceOffset = index * segmentDuration;
+    page.audioGroupId = groupId;
+    page.audioGroupSize = targets.length;
+  });
+}
+
+function detachAudioGroupsForPages(targets: SlidePage[]): void {
+  const groupIds = new Set(targets.map((page) => page.audioGroupId).filter(Boolean));
+  state.pages.forEach((page) => {
+    if (targets.includes(page) || (page.audioGroupId && groupIds.has(page.audioGroupId))) {
+      clearPageAudio(page);
+    }
+  });
+}
+
+function clearPageAudio(page: SlidePage): void {
+  page.voiceUrl = "";
+  page.voiceDuration = 0;
+  page.voiceSourceDuration = 0;
+  page.voiceOffset = 0;
+  page.audioGroupId = "";
+  page.audioGroupSize = 1;
+}
+
+function refreshAudioGroups(): void {
+  const groupIds = new Set(state.pages.map((page) => page.audioGroupId).filter(Boolean));
+  groupIds.forEach((groupId) => {
+    const pages = state.pages.filter((page) => page.audioGroupId === groupId);
+    const sourceDuration = pages[0]?.voiceSourceDuration || pages.reduce((sum, page) => sum + page.voiceDuration, 0);
+
+    if (pages.length === 1) {
+      pages[0].audioGroupId = "";
+      pages[0].audioGroupSize = 1;
+      pages[0].voiceOffset = 0;
+      pages[0].voiceDuration = sourceDuration;
+      return;
+    }
+
+    const segmentDuration = sourceDuration / pages.length;
+    pages.forEach((page, index) => {
+      page.audioGroupSize = pages.length;
+      page.voiceDuration = segmentDuration;
+      page.voiceOffset = index * segmentDuration;
+      page.voiceSourceDuration = sourceDuration;
+    });
+  });
 }
 
 async function toggleScreenRecording(): Promise<void> {
@@ -1108,14 +1301,20 @@ function newPresentation(): void {
 
   state.pages = [createPage(1)];
   state.selectedPageId = state.pages[0].id;
+  state.audioTargetPageIds = [state.pages[0].id];
   state.presentationName = "Nouvelle presentation";
   state.selectedPresentationFile = "";
   state.resolutionIndex = 1;
   state.qualityIndex = 1;
   state.videoUrl = "";
   state.videoSize = 0;
+  state.backendVideoUrl = "";
+  state.backendVideoPath = "";
+  state.backendVideoSize = 0;
+  state.backendVideoUpdatedAt = "";
   state.renderProgress = "Nouvelle presentation creee.";
   render();
+  void refreshBackendVideoStatus().then(() => render());
 }
 
 async function refreshPresentationFiles(): Promise<void> {
@@ -1126,14 +1325,65 @@ async function refreshPresentationFiles(): Promise<void> {
 
   const payload = await response.json() as {
     presentationDirectory: string;
+    exportDirectory?: string;
     presentations: PresentationListItem[];
   };
   state.backendReady = true;
   state.backendDirectory = payload.presentationDirectory;
+  state.exportDirectory = payload.exportDirectory ?? "";
   state.presentationFiles = payload.presentations;
 
   if (state.selectedPresentationFile && !state.presentationFiles.some((item) => item.id === state.selectedPresentationFile)) {
     state.selectedPresentationFile = "";
+  }
+}
+
+function clearBackendVideoStatus(): void {
+  state.backendVideoUrl = "";
+  state.backendVideoPath = "";
+  state.backendVideoSize = 0;
+  state.backendVideoUpdatedAt = "";
+}
+
+function scheduleBackendVideoLookup(): void {
+  window.clearTimeout(backendVideoLookupTimer);
+  clearBackendVideoStatus();
+  backendVideoLookupTimer = window.setTimeout(() => {
+    void refreshBackendVideoStatus().then(() => render());
+  }, 350);
+}
+
+async function refreshBackendVideoStatus(): Promise<void> {
+  if (!state.backendReady) {
+    clearBackendVideoStatus();
+    return;
+  }
+
+  try {
+    const response = await fetch(`/api/exports/latest?name=${encodeURIComponent(normalizedPresentationName())}`, { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error("Video introuvable");
+    }
+
+    const payload = await response.json() as {
+      exists: boolean;
+      url: string;
+      outputPath: string;
+      size: number;
+      updatedAt: string;
+    };
+
+    if (payload.exists) {
+      const cacheKey = payload.updatedAt || String(Date.now());
+      state.backendVideoUrl = `${payload.url}?v=${encodeURIComponent(cacheKey)}`;
+      state.backendVideoPath = payload.outputPath;
+      state.backendVideoSize = payload.size;
+      state.backendVideoUpdatedAt = payload.updatedAt;
+    } else {
+      clearBackendVideoStatus();
+    }
+  } catch {
+    clearBackendVideoStatus();
   }
 }
 
@@ -1149,6 +1399,7 @@ async function openSelectedPresentation(): Promise<void> {
     }
     const rawPresentation = await response.json() as Partial<SavedPresentation>;
     applySavedPresentation(rawPresentation, presentationNameFromFile(state.selectedPresentationFile));
+    await refreshBackendVideoStatus();
     render();
   } catch {
     state.renderProgress = "Impossible d'ouvrir cette presentation.";
@@ -1205,6 +1456,7 @@ async function savePresentation(): Promise<void> {
     }
     state.selectedPresentationFile = fileName;
     await refreshPresentationFiles();
+    await refreshBackendVideoStatus();
     state.renderProgress = "Presentation sauvegardee.";
   } catch {
     state.renderProgress = "Impossible de sauvegarder la presentation.";
@@ -1234,6 +1486,10 @@ async function buildSavedPresentation(): Promise<SavedPresentation> {
         screenAudioEnabled: page.screenAudioEnabled,
         voiceUrl: await urlToDataUrl(page.voiceUrl),
         voiceDuration: page.voiceDuration,
+        voiceSourceDuration: page.voiceSourceDuration,
+        voiceOffset: page.voiceOffset,
+        audioGroupId: page.audioGroupId,
+        audioGroupSize: page.audioGroupSize,
       })),
     ),
   };
@@ -1257,7 +1513,13 @@ function applySavedPresentation(rawPresentation: Partial<SavedPresentation>, fal
     screenTrimEnd: Math.max(0, Number(page.screenTrimEnd) || 0),
     screenAudioEnabled: page.screenAudioEnabled !== false,
     voiceUrl: typeof page.voiceUrl === "string" ? page.voiceUrl : "",
-    voiceDuration: normalizeDuration(Number(page.voiceDuration)),
+    voiceDuration: typeof page.voiceUrl === "string" && page.voiceUrl ? normalizeDuration(Number(page.voiceDuration)) : 0,
+    voiceSourceDuration: typeof page.voiceUrl === "string" && page.voiceUrl
+      ? Math.max(0, Number(page.voiceSourceDuration) || Number(page.voiceDuration) || 0)
+      : 0,
+    voiceOffset: Math.max(0, Number(page.voiceOffset) || 0),
+    audioGroupId: typeof page.audioGroupId === "string" ? page.audioGroupId : "",
+    audioGroupSize: Math.max(1, Number(page.audioGroupSize) || 1),
   }));
 
   if (state.pages.length === 0) {
@@ -1268,10 +1530,13 @@ function applySavedPresentation(rawPresentation: Partial<SavedPresentation>, fal
     ? rawPresentation.name
     : fallbackName;
   state.selectedPageId = state.pages[0].id;
+  state.audioTargetPageIds = [state.pages[0].id];
+  refreshAudioGroups();
   state.resolutionIndex = clampIndex(Number(rawPresentation.resolutionIndex), resolutions.length, 1);
   state.qualityIndex = clampIndex(Number(rawPresentation.qualityIndex), qualities.length, 1);
   state.videoUrl = "";
   state.videoSize = 0;
+  clearBackendVideoStatus();
   state.renderProgress = "Presentation chargee.";
 }
 
@@ -1362,6 +1627,144 @@ async function generateVideo(): Promise<void> {
   render();
 }
 
+async function generateBackendVideo(): Promise<void> {
+  if (state.isRendering) {
+    return;
+  }
+
+  if (!state.backendReady) {
+    state.renderProgress = "L'API backend est indisponible.";
+    render();
+    return;
+  }
+
+  state.isRendering = true;
+  state.videoUrl = "";
+  state.videoSize = 0;
+  state.backendVideoUrl = "";
+  state.backendVideoPath = "";
+  state.backendVideoSize = 0;
+  state.backendVideoUpdatedAt = "";
+  state.renderProgress = "Creation de l'export backend...";
+  render();
+
+  try {
+    const startResponse = await fetch("/api/exports", { method: "POST" });
+    if (!startResponse.ok) {
+      throw new Error("Creation export impossible");
+    }
+
+    const startPayload = await startResponse.json() as { jobId: string };
+    const hasAudio = state.pages.some((page) => Boolean(page.voiceUrl || (page.screenVideoUrl && page.screenAudioEnabled)));
+
+    for (let index = 0; index < state.pages.length; index += 1) {
+      const page = state.pages[index];
+      state.renderProgress = `Rendu et envoi page ${index + 1} / ${state.pages.length}`;
+      render();
+
+      const chunk = await renderPageChunk(page, hasAudio);
+      if (chunk.size === 0) {
+        throw new Error(`Morceau vide pour la page ${index + 1}`);
+      }
+
+      const uploadResponse = await fetch(`/api/exports/${encodeURIComponent(startPayload.jobId)}/chunks/${index}`, {
+        method: "PUT",
+        headers: { "Content-Type": chunk.type || "video/webm" },
+        body: chunk,
+      });
+      if (!uploadResponse.ok) {
+        throw new Error(`Envoi impossible pour la page ${index + 1}`);
+      }
+    }
+
+    state.renderProgress = "Assemblage backend avec ffmpeg...";
+    render();
+
+    const finishResponse = await fetch(`/api/exports/${encodeURIComponent(startPayload.jobId)}/finish`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: normalizedPresentationName() }),
+    });
+    if (!finishResponse.ok) {
+      throw new Error("Assemblage backend impossible");
+    }
+
+    const finishPayload = await finishResponse.json() as { url: string; outputPath: string; size: number; updatedAt: string };
+    const cacheKey = finishPayload.updatedAt || String(Date.now());
+    state.backendVideoUrl = `${finishPayload.url}?v=${encodeURIComponent(cacheKey)}`;
+    state.backendVideoPath = finishPayload.outputPath;
+    state.backendVideoSize = finishPayload.size;
+    state.backendVideoUpdatedAt = finishPayload.updatedAt;
+    state.renderProgress = "Video backend prete.";
+  } catch (error) {
+    state.renderProgress = error instanceof Error ? error.message : "Generation backend impossible.";
+  } finally {
+    state.isRendering = false;
+    render();
+  }
+}
+
+async function renderPageChunk(page: SlidePage, forceAudio: boolean): Promise<Blob> {
+  if (typeof MediaRecorder === "undefined") {
+    throw new Error("Votre navigateur ne permet pas l'export video.");
+  }
+
+  const resolution = resolutions[state.resolutionIndex];
+  const quality = qualities[state.qualityIndex];
+  const canvas = document.createElement("canvas");
+  canvas.width = resolution.width;
+  canvas.height = resolution.height;
+  const context = canvas.getContext("2d");
+
+  if (!context) {
+    throw new Error("Canvas indisponible.");
+  }
+
+  const canvasStream = canvas.captureStream(0);
+  const canvasVideoTrack = canvasStream.getVideoTracks()[0] as (MediaStreamTrack & { requestFrame?: () => void }) | undefined;
+  const audioContext = forceAudio ? new AudioContext({ sampleRate: 48_000 }) : null;
+  const audioDestination = audioContext?.createMediaStreamDestination() ?? null;
+  audioDestination?.stream.getAudioTracks().forEach((track) => canvasStream.addTrack(track));
+  const mimeType = chooseMimeType();
+  const recorderOptions: MediaRecorderOptions = {
+    videoBitsPerSecond: quality.videoBitsPerSecond,
+  };
+
+  if (forceAudio) {
+    recorderOptions.audioBitsPerSecond = AUDIO_BITS_PER_SECOND;
+  }
+  if (mimeType) {
+    recorderOptions.mimeType = mimeType;
+  }
+
+  const recorder = new MediaRecorder(canvasStream, recorderOptions);
+  const chunks: Blob[] = [];
+  const finished = new Promise<Blob>((resolve) => {
+    recorder.addEventListener("stop", () => {
+      resolve(new Blob(chunks, { type: mimeType || "video/webm" }));
+    });
+  });
+
+  recorder.addEventListener("dataavailable", (event) => {
+    if (event.data.size > 0) {
+      chunks.push(event.data);
+    }
+  });
+
+  try {
+    recorder.start(250);
+    await wait(100);
+    await drawPageForDuration(context, canvas, page, audioContext, audioDestination, canvasVideoTrack);
+    recorder.requestData();
+    await wait(250);
+    recorder.stop();
+    return await finished;
+  } finally {
+    await audioContext?.close();
+    canvasStream.getTracks().forEach((track) => track.stop());
+  }
+}
+
 async function drawPageForDuration(
   context: CanvasRenderingContext2D,
   canvas: HTMLCanvasElement,
@@ -1380,7 +1783,10 @@ async function drawPageForDuration(
     ? connectMediaElementToMix(screenVideo, audioContext, audioDestination)
     : null;
   const voiceAudio = page.voiceUrl && audioContext && audioDestination
-    ? await createAudioElement(page.voiceUrl, audioContext, audioDestination)
+    ? await createAudioElement(page.voiceUrl, audioContext, audioDestination, page.voiceOffset)
+    : null;
+  const silentAudio = audioContext && audioDestination && !screenAudioSource && !voiceAudio
+    ? connectSilentAudio(audioContext, audioDestination)
     : null;
 
   if (screenVideo) {
@@ -1388,7 +1794,9 @@ async function drawPageForDuration(
     await waitForSeek(screenVideo);
     await screenVideo.play().catch(() => undefined);
   }
+  await audioContext?.resume();
   voiceAudio?.play();
+  silentAudio?.start();
 
   await new Promise<void>((resolve) => {
     let frame = 0;
@@ -1415,6 +1823,8 @@ async function drawPageForDuration(
   });
 
   screenAudioSource?.disconnect();
+  silentAudio?.stop();
+  silentAudio?.disconnect();
   voiceAudio?.pause();
   screenVideo?.pause();
 }
@@ -1423,15 +1833,29 @@ async function createAudioElement(
   url: string,
   audioContext: AudioContext,
   audioDestination: MediaStreamAudioDestinationNode,
+  offset = 0,
 ): Promise<HTMLAudioElement> {
   const audio = new Audio(url);
   audio.crossOrigin = "anonymous";
   audio.preload = "auto";
-  audio.currentTime = 0;
+  await ensureMediaMetadata(audio);
+  const maximumOffset = Number.isFinite(audio.duration) ? Math.max(0, audio.duration - 0.05) : offset;
+  audio.currentTime = clampNumber(offset, 0, maximumOffset);
   const source = audioContext.createMediaElementSource(audio);
   source.connect(audioDestination);
   await audioContext.resume();
   return audio;
+}
+
+function ensureMediaMetadata(media: HTMLMediaElement): Promise<void> {
+  if (media.readyState >= HTMLMediaElement.HAVE_METADATA && Number.isFinite(media.duration)) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    media.addEventListener("loadedmetadata", () => resolve(), { once: true });
+    media.addEventListener("error", () => resolve(), { once: true });
+  });
 }
 
 function connectMediaElementToMix(
@@ -1440,6 +1864,16 @@ function connectMediaElementToMix(
   audioDestination: MediaStreamAudioDestinationNode,
 ): MediaElementAudioSourceNode {
   const source = audioContext.createMediaElementSource(media);
+  source.connect(audioDestination);
+  return source;
+}
+
+function connectSilentAudio(
+  audioContext: AudioContext,
+  audioDestination: MediaStreamAudioDestinationNode,
+): ConstantSourceNode {
+  const source = audioContext.createConstantSource();
+  source.offset.value = 0;
   source.connect(audioDestination);
   return source;
 }
@@ -1469,8 +1903,10 @@ function drawSlide(
     context.fillRect(0, 0, canvas.width, canvas.height);
   }
 
-  context.fillStyle = screenVideo ? "rgba(0, 0, 0, 0.22)" : "rgba(0, 0, 0, 0.42)";
-  context.fillRect(0, 0, canvas.width, canvas.height);
+  if (screenVideo) {
+    context.fillStyle = "rgba(0, 0, 0, 0.08)";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+  }
 
   const padding = canvas.width * 0.08;
   const hasVisual = Boolean(foreground);
@@ -1485,9 +1921,15 @@ function drawSlide(
   context.font = `700 ${fontSize}px Inter, Segoe UI, Arial`;
   context.textBaseline = "top";
   context.fillStyle = "#ffffff";
+  context.shadowColor = "rgba(0, 0, 0, 0.7)";
+  context.shadowBlur = Math.max(8, Math.floor(fontSize * 0.28));
+  context.shadowOffsetY = Math.max(2, Math.floor(fontSize * 0.08));
   lines.forEach((line, index) => {
     context.fillText(line, textX, textY + index * lineHeight);
   });
+  context.shadowColor = "transparent";
+  context.shadowBlur = 0;
+  context.shadowOffsetY = 0;
 
   if (foreground) {
     const boxX = canvas.width * 0.56;
@@ -1696,6 +2138,18 @@ function formatFileSize(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} Mo`;
 }
 
+function formatDateTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+
+  return new Intl.DateTimeFormat("fr-FR", {
+    dateStyle: "short",
+    timeStyle: "short",
+  }).format(date);
+}
+
 function escapeHtml(value: string): string {
   return value
     .replaceAll("&", "&amp;")
@@ -1707,10 +2161,12 @@ function escapeHtml(value: string): string {
 
 render();
 void refreshPresentationFiles()
+  .then(() => refreshBackendVideoStatus())
   .then(() => render())
   .catch(() => {
     state.backendReady = false;
     state.backendDirectory = "";
+    state.exportDirectory = "";
     state.renderProgress = "API backend indisponible.";
     render();
   });
